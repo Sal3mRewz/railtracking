@@ -4,7 +4,7 @@ A Home Assistant Lovelace card that shows live departures and arrivals for any G
 
 For each train it shows the advertised time, the expected time and how many minutes late it is. It also shows the platform (highlighted when it has changed) and marks cancellations, with the reason when one is given. Departed trains drop off the list, and arrived trains stay for a few minutes.
 
-Click a train to see all its stops, with live times, platforms and which stops it has already called at. You can also pick a **via** station, so the board only shows trains that stop there, with their time at that station. It refreshes automatically and has a visual editor.
+Click a train to see all its stops, with live times, platforms and which stops it has already called at. You can also pick a **destination**, so the departures list only shows trains that stop there, with their arrival time. It refreshes automatically and has a visual editor.
 
 ## Get an API key
 
@@ -35,14 +35,14 @@ api_key: rf_live_...
 station: LDS
 mode: both
 rows: 6
-via: YRK   # optional
+destination: YRK   # optional
 ```
 
 | Option | Default | Description |
 | --- | --- | --- |
 | `api_key` | — | **Required.** Your RailFeed API key |
 | `station` | — | **Required.** 3-letter station (CRS) code, e.g. `LDS`, `MAN`, `EDB` |
-| `via` | — | Only show trains that also call at this station (CRS code), with their time there |
+| `destination` | — | Only show departures that call at this station (CRS code), with their arrival time there. Arrivals aren't filtered. (`via` from v1.1.0 still works.) |
 | `title` | station name | Card title |
 | `mode` | `both` | `both`, `departures` or `arrivals` |
 | `rows` | `6` | Trains shown in each list |
@@ -53,9 +53,9 @@ via: YRK   # optional
 | `show_operator` | `false` | Show the train operator |
 | `api_url` | `https://railfeed.co.uk/api` | Override the API base URL |
 
-In the visual editor, type part of a station's name (or its code) into **Station** and pick it from the list. The search uses RailFeed, so add your API key first. Pick a **Via** station the same way, and clear the box to remove it. In YAML, `station` and `via` take the 3-letter CRS code, which the search shows next to each name.
+In the visual editor, type part of a station's name (or its code) into **Station** and pick it from the list. The search uses RailFeed, so add your API key first. Pick a **Destination** the same way, and clear the box to remove it. In YAML, `station` and `destination` take the 3-letter CRS code, which the search shows next to each name.
 
-The via filter uses RailFeed's timetable of direct trains between the two stations, which the card loads once a day. Opening a train's stops makes one extra request per refresh while it's open.
+The destination filter uses RailFeed's timetable of direct trains between the two stations, which the card loads once a day. Opening a train's stops makes one extra request per refresh while it's open.
 
 RailFeed allows 60 requests a minute per key. Each card makes one request per refresh, so the default of 60 seconds leaves plenty of room for several cards.
 

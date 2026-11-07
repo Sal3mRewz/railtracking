@@ -12,7 +12,7 @@
  *   station: LDS               # CRS code of the station
  *   mode: both                 # both | departures | arrivals
  *   rows: 6
- *   via: YRK                   # optional: only trains that also call here
+ *   destination: YRK           # optional: only departures calling here
  *
  * Click a train to show its calling points.
  *
@@ -115,7 +115,10 @@ class RailTrackingCard extends HTMLElement {
       api_key: String(config.api_key).trim(),
       api_url: (config.api_url ?? DEFAULT_API_URL).replace(/\/+$/, ""),
       station: parseCrs(config.station, "station"),
-      via: config.via ? parseCrs(config.via, "via") : null,
+      // `via` is the old name for this option, kept so existing cards work.
+      destination: config.destination ?? config.via
+        ? parseCrs(config.destination ?? config.via, "destination")
+        : null,
       title: config.title,
       mode,
       rows: Math.min(Math.max(Number(config.rows ?? DEFAULTS.rows), 1), 50),
@@ -141,7 +144,7 @@ class RailTrackingCard extends HTMLElement {
       this._lastRequestKey = requestKey;
       this._board = null;
       this._error = null;
-      this._via = null;
+      this._dest = null;
       this._expanded = null;
       this._stops = null;
       if (this.isConnected) this._startPolling();
@@ -185,8 +188,8 @@ class RailTrackingCard extends HTMLElement {
   }
 
   _requestKey() {
-    const { api_key, api_url, station, via, mode, hours } = this._config;
-    return JSON.stringify([api_key, api_url, station, via, mode, hours]);
+    const { api_key, api_url, station, destination, mode, hours } = this._config;
+    return JSON.stringify([api_key, api_url, station, destination, mode, hours]);
   }
 
   _startPolling() {
@@ -224,7 +227,7 @@ class RailTrackingCard extends HTMLElement {
         { crs: c.station, type: c.mode, hours: String(c.hours) },
         abort.signal
       );
-      await this._loadVia(board.date, abort.signal);
+      await this._loadDestination(board.date, abort.signal);
       this._board = board;
       this._error = null;
     } catch (err) {
@@ -237,30 +240,22 @@ class RailTrackingCard extends HTMLElement {
   }
 
   // The live board can't filter by calling point, so look up which trains
-  // run directly between this station and the via station today (one
-  // request per list, repeated only when the date changes) and filter the
-  // board by those.
-  async _loadVia(date, signal) {
+  // run directly from this station to the destination today (one request,
+  // repeated only when the date changes) and filter departures by those.
+  async _loadDestination(date, signal) {
     const c = this._config;
-    if (!c.via || this._via?.date === date) return;
-    const via = { date };
-    const kinds = c.mode === "both" ? ["departures", "arrivals"] : [c.mode];
-    for (const kind of kinds) {
-      const dep = kind === "departures";
-      const body = await this._get(
-        "services",
-        { from: dep ? c.station : c.via, to: dep ? c.via : c.station, date },
-        signal
-      );
-      via.name = titleCase(dep ? body.to : body.from);
-      via[kind] = new Map(
+    if (!c.destination || c.mode === "arrivals" || this._dest?.date === date) return;
+    const body = await this._get("services", { from: c.station, to: c.destination, date }, signal);
+    this._dest = {
+      date,
+      name: titleCase(body.to),
+      times: new Map(
         (body.services ?? [])
-          .filter((s) => !(dep ? s.to_is_pass : s.from_is_pass))
-          .map((s) => [s.uid, hhmm(dep ? s.to_public_arrival : s.from_public_departure)])
+          .filter((s) => !s.to_is_pass)
+          .map((s) => [s.uid, hhmm(s.to_public_arrival)])
           .filter(([, time]) => time)
-      );
-    }
-    this._via = via;
+      ),
+    };
   }
 
   _onRowActivate(ev) {
@@ -330,9 +325,8 @@ class RailTrackingCard extends HTMLElement {
         const cancelled = s.status === "cancelled" || Boolean(s.cancel_type);
         return {
           uid: s.uid,
-          viaTime: this._via?.[kind]?.get(s.uid),
-          // "via York" is redundant on a train to (or from) York.
-          viaIsEnd: (dep ? s.destination_crs : s.origin_crs) === this._config.via,
+          destTime: dep ? this._dest?.times.get(s.uid) : null,
+          destIsEnd: s.destination_crs === this._config.destination,
           scheduled,
           expected,
           actual,
@@ -346,7 +340,7 @@ class RailTrackingCard extends HTMLElement {
       })
       .filter((s) => {
         if (!s.scheduled) return false;
-        if (this._config.via && !s.viaTime) return false;
+        if (dep && this._config.destination && !s.destTime) return false;
         if (!s.actual) return true;
         // Departed trains drop off; arrived ones linger briefly.
         return !dep && minutesBetween(s.actual, nowText) <= ARRIVED_GRACE_MINS;
@@ -386,8 +380,10 @@ class RailTrackingCard extends HTMLElement {
             const operator = show_operator && s.operator ? `<div class="operator">${escapeHtml(s.operator)}</div>` : "";
             const reason = show_reason && s.reason && (s.cancelled || status.time)
               ? `<div class="reason">${escapeHtml(s.reason)}</div>` : "";
-            const via = s.viaTime && !s.viaIsEnd
-              ? `<div class="via">via ${escapeHtml(this._via.name)} ${escapeHtml(s.viaTime)}</div>` : "";
+            // The place is already the destination when the train ends there.
+            const dest = s.destTime
+              ? `<div class="dest">Arrives ${s.destIsEnd ? "" : `${escapeHtml(this._dest.name)} `}${escapeHtml(s.destTime)}</div>`
+              : "";
             const open = this._expanded?.uid === s.uid && this._expanded.kind === kind;
             const stops = open
               ? `<tr class="stops-row"><td colspan="${show_platform ? 4 : 3}">${this._stopsHtml()}</td></tr>`
@@ -398,7 +394,7 @@ class RailTrackingCard extends HTMLElement {
                 <span class="${status.time || s.cancelled ? "scheduled struck" : "scheduled"}">${escapeHtml(s.scheduled)}</span>
                 ${status.time ? `<span class="expected">${escapeHtml(status.time)}</span>` : ""}
               </td>
-              <td class="place">${escapeHtml(s.place)}${via}${operator}${reason}</td>
+              <td class="place">${escapeHtml(s.place)}${dest}${operator}${reason}</td>
               ${show_platform ? `<td class="platform ${s.platformChanged ? "changed" : ""}"
                   ${s.platformChanged ? 'title="Platform changed"' : ""}>${escapeHtml(s.platform ?? "")}</td>` : ""}
               <td class="status"><span class="badge">${escapeHtml(status.text)}</span></td>
@@ -406,7 +402,7 @@ class RailTrackingCard extends HTMLElement {
           })
           .join("")
       : `<tr><td colspan="4" class="empty">No ${heading.toLowerCase()}${
-          this._via ? ` via ${escapeHtml(this._via.name)}` : ""
+          kind === "departures" && this._dest ? ` to ${escapeHtml(this._dest.name)}` : ""
         } in the next ${hours} hour${hours === 1 ? "" : "s"}</td></tr>`;
 
     return `<div class="list">
@@ -461,7 +457,7 @@ class RailTrackingCard extends HTMLElement {
           "stop",
           actual ? "passed" : "",
           s.crs === c.station ? "here" : "",
-          c.via && s.crs === c.via ? "via-stop" : "",
+          c.destination && s.crs === c.destination ? "dest-stop" : "",
           cancelled ? "cancelled-stop" : "",
         ].join(" ");
         return `<li class="${classes}">
@@ -482,7 +478,8 @@ class RailTrackingCard extends HTMLElement {
     const c = this._config;
     const board = this._board;
     const title = c.title ?? (board?.station ? titleCase(board.station) : c.station);
-    const subtitle = c.via ? `via ${this._via?.name ?? c.via}` : "";
+    const subtitle =
+      c.destination && c.mode !== "arrivals" ? `Departures to ${this._dest?.name ?? c.destination}` : "";
 
     let body;
     if (this._error && !board) {
@@ -495,7 +492,7 @@ class RailTrackingCard extends HTMLElement {
     }
 
     const updated = this._fetchedAt
-      ? new Date(this._fetchedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+      ? new Date(this._fetchedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" })
       : "";
 
     this.shadowRoot.innerHTML = `
@@ -503,7 +500,9 @@ class RailTrackingCard extends HTMLElement {
         ha-card { padding: 16px; }
         .header { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
         .title { font-size: 1.2em; font-weight: 500; }
-        .updated { color: var(--secondary-text-color); font-size: 0.8em; white-space: nowrap; }
+        .updated { text-align: right; white-space: nowrap; line-height: 1.1; }
+        .updated-time { font-size: 1.3em; font-weight: 500; font-variant-numeric: tabular-nums; }
+        .updated-label { display: block; font-size: 0.75em; color: var(--secondary-text-color); }
         .stale { color: var(--warning-color, #ffa600); }
         .list { margin-top: 12px; }
         .list-title { font-weight: 500; color: var(--secondary-text-color); margin-bottom: 4px; }
@@ -531,7 +530,7 @@ class RailTrackingCard extends HTMLElement {
         .cancelled .place { color: var(--secondary-text-color); }
         .empty, .loading { color: var(--secondary-text-color); text-align: center; padding: 12px; }
         .error { color: var(--error-color, #db4437); margin-top: 12px; }
-        .subtitle, .via { color: var(--secondary-text-color); font-size: 0.85em; }
+        .subtitle, .dest { color: var(--secondary-text-color); font-size: 0.85em; }
         tr.service { cursor: pointer; }
         tr.service:hover td, tr.service.open td { background: var(--secondary-background-color); }
         tr.service:focus-visible { outline: 2px solid var(--primary-color); outline-offset: -2px; }
@@ -549,7 +548,7 @@ class RailTrackingCard extends HTMLElement {
                        border: 2px solid var(--primary-color); box-sizing: border-box; }
         .stop.passed::after { background: var(--primary-color); }
         .stop.passed { color: var(--secondary-text-color); }
-        .stop.here .stop-name, .stop.via-stop .stop-name { font-weight: 600; }
+        .stop.here .stop-name, .stop.dest-stop .stop-name { font-weight: 600; }
         .stop.cancelled-stop .stop-time { text-decoration: line-through; }
         .stop-time { font-variant-numeric: tabular-nums; width: 3em; flex: none; }
         .stop-name { flex: 1; }
@@ -565,8 +564,11 @@ class RailTrackingCard extends HTMLElement {
             <div class="title">${escapeHtml(title)}</div>
             ${subtitle ? `<div class="subtitle">${escapeHtml(subtitle)}</div>` : ""}
           </div>
-          <div class="updated ${this._error && board ? "stale" : ""}"
-               title="${escapeHtml(this._error ?? "")}">${this._error && board ? "⚠ " : ""}${updated}</div>
+          ${updated ? `<div class="updated ${this._error && board ? "stale" : ""}"
+               title="${escapeHtml(this._error ?? "")}">
+            <span class="updated-time">${this._error && board ? "⚠ " : ""}${updated}</span>
+            <span class="updated-label">${this._error && board ? "Update failed" : "Updated"}</span>
+          </div>` : ""}
         </div>
         ${body}
       </ha-card>
@@ -585,6 +587,11 @@ class RailTrackingCardEditor extends HTMLElement {
     // Ignore the echo of our own change coming back from HA.
     if (this._lastSent && JSON.stringify(config) === this._lastSent) return;
     this._config = { ...config };
+    // `via` was renamed to `destination`; carry it over on the next save.
+    if (this._config.via) {
+      this._config.destination ??= this._config.via;
+      delete this._config.via;
+    }
     this._render();
   }
 
@@ -634,13 +641,13 @@ class RailTrackingCardEditor extends HTMLElement {
     this._emit();
   }
 
-  // `field` is the config key the search sets: "station" or "via".
+  // `field` is the config key the search sets: "station" or "destination".
   _onSearch(field, query) {
     clearTimeout(this._searchTimer);
     const q = query.trim();
-    // Via is optional, so clearing its box removes it.
-    if (field === "via" && !q && this._config.via) {
-      delete this._config.via;
+    // Destination is optional, so clearing its box removes it.
+    if (field === "destination" && !q && this._config.destination) {
+      delete this._config.destination;
       this._emit();
     }
     if (q.length < 2) {
@@ -769,7 +776,7 @@ class RailTrackingCardEditor extends HTMLElement {
         <div class="hint wide">It's saved in the dashboard config, so anyone who can edit this dashboard can see it.
           A public_tools key is enough.</div>
         ${this._searchField("station", "Station", "Search by name or code, e.g. York")}
-        ${this._searchField("via", "Via (optional)", "Only show trains that also stop here")}
+        ${this._searchField("destination", "Destination (optional)", "Only show departures that stop here")}
         <label class="wide">Title<input type="text" data-key="title" value="${escapeHtml(c.title)}" placeholder="station name"></label>
         <label>Show
           <select data-key="mode">

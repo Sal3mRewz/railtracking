@@ -1,0 +1,15 @@
+{
+  "name": "rail-tracking-card",
+  "version": "1.0.0",
+  "description": "Home Assistant Lovelace card showing live arrivals and departures for a GB railway station from National Rail Darwin",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/rail-tracking-card.js --bundle --minify --format=esm --target=es2020 --outfile=dist/rail-tracking-card.js",
+    "watch": "npm run build -- --watch"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}

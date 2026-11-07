@@ -12,6 +12,9 @@
  *   station: LDS               # CRS code of the station
  *   mode: both                 # both | departures | arrivals
  *   rows: 6
+ *   via: YRK                   # optional: only trains that also call here
+ *
+ * Click a train to show its calling points.
  *
  * The API is called straight from the browser, so the key is stored in the
  * dashboard config. Anyone who can edit the dashboard can read it.
@@ -112,6 +115,7 @@ class RailTrackingCard extends HTMLElement {
       api_key: String(config.api_key).trim(),
       api_url: (config.api_url ?? DEFAULT_API_URL).replace(/\/+$/, ""),
       station: parseCrs(config.station, "station"),
+      via: config.via ? parseCrs(config.via, "via") : null,
       title: config.title,
       mode,
       rows: Math.min(Math.max(Number(config.rows ?? DEFAULTS.rows), 1), 50),
@@ -123,7 +127,13 @@ class RailTrackingCard extends HTMLElement {
       show_reason: config.show_reason !== false,
     };
 
-    if (!this.shadowRoot) this.attachShadow({ mode: "open" });
+    if (!this.shadowRoot) {
+      this.attachShadow({ mode: "open" });
+      this.shadowRoot.addEventListener("click", (ev) => this._onRowActivate(ev));
+      this.shadowRoot.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" || ev.key === " ") this._onRowActivate(ev);
+      });
+    }
 
     // Only refetch when something that affects the request has changed.
     const requestKey = this._requestKey();
@@ -131,6 +141,9 @@ class RailTrackingCard extends HTMLElement {
       this._lastRequestKey = requestKey;
       this._board = null;
       this._error = null;
+      this._via = null;
+      this._expanded = null;
+      this._stops = null;
       if (this.isConnected) this._startPolling();
     } else if (previous.refresh_interval !== this._config.refresh_interval && this.isConnected) {
       this._startPolling();
@@ -172,8 +185,8 @@ class RailTrackingCard extends HTMLElement {
   }
 
   _requestKey() {
-    const { api_key, api_url, station, mode, hours } = this._config;
-    return JSON.stringify([api_key, api_url, station, mode, hours]);
+    const { api_key, api_url, station, via, mode, hours } = this._config;
+    return JSON.stringify([api_key, api_url, station, via, mode, hours]);
   }
 
   _startPolling() {
@@ -190,20 +203,29 @@ class RailTrackingCard extends HTMLElement {
     return !this._fetchedAt || Date.now() - this._fetchedAt > this._config.refresh_interval * 1000;
   }
 
+  async _get(path, params, signal) {
+    const c = this._config;
+    const res = await fetch(`${c.api_url}/${path}?${new URLSearchParams(params)}`, {
+      headers: { "X-Api-Key": c.api_key, Accept: "application/json" },
+      signal,
+    });
+    const body = await res.json().catch(() => null);
+    if (!res.ok) throw new Error(this._errorText(res.status, body));
+    return body;
+  }
+
   async _fetch() {
     const c = this._config;
-    const params = new URLSearchParams({ crs: c.station, type: c.mode, hours: String(c.hours) });
-
     this._abort?.abort();
     const abort = (this._abort = new AbortController());
     try {
-      const res = await fetch(`${c.api_url}/live_board?${params}`, {
-        headers: { "X-Api-Key": c.api_key, Accept: "application/json" },
-        signal: abort.signal,
-      });
-      const body = await res.json().catch(() => null);
-      if (!res.ok) throw new Error(this._errorText(res.status, body));
-      this._board = body;
+      const board = await this._get(
+        "live_board",
+        { crs: c.station, type: c.mode, hours: String(c.hours) },
+        abort.signal
+      );
+      await this._loadVia(board.date, abort.signal);
+      this._board = board;
       this._error = null;
     } catch (err) {
       if (err.name === "AbortError") return;
@@ -211,6 +233,64 @@ class RailTrackingCard extends HTMLElement {
     }
     this._fetchedAt = Date.now();
     this._render();
+    if (this._expanded) this._loadStops(this._expanded.uid);
+  }
+
+  // The live board can't filter by calling point, so look up which trains
+  // run directly between this station and the via station today (one
+  // request per list, repeated only when the date changes) and filter the
+  // board by those.
+  async _loadVia(date, signal) {
+    const c = this._config;
+    if (!c.via || this._via?.date === date) return;
+    const via = { date };
+    const kinds = c.mode === "both" ? ["departures", "arrivals"] : [c.mode];
+    for (const kind of kinds) {
+      const dep = kind === "departures";
+      const body = await this._get(
+        "services",
+        { from: dep ? c.station : c.via, to: dep ? c.via : c.station, date },
+        signal
+      );
+      via.name = titleCase(dep ? body.to : body.from);
+      via[kind] = new Map(
+        (body.services ?? [])
+          .filter((s) => !(dep ? s.to_is_pass : s.from_is_pass))
+          .map((s) => [s.uid, hhmm(dep ? s.to_public_arrival : s.from_public_departure)])
+          .filter(([, time]) => time)
+      );
+    }
+    this._via = via;
+  }
+
+  _onRowActivate(ev) {
+    const row = ev.target.closest?.("tr.service");
+    if (!row) return;
+    ev.preventDefault();
+    const { uid, kind } = row.dataset;
+    if (this._expanded?.uid === uid && this._expanded.kind === kind) {
+      this._expanded = null;
+    } else {
+      this._expanded = { uid, kind };
+      // Only the open train's stops are kept, to keep API use down.
+      if (this._stops?.uid !== uid) this._stops = { uid };
+      this._loadStops(uid);
+    }
+    this._render();
+  }
+
+  async _loadStops(uid) {
+    if (this._stops?.uid !== uid) this._stops = { uid };
+    const entry = this._stops;
+    entry.loading = true;
+    try {
+      entry.data = await this._get("service_live", { uid, date: this._board?.date ?? "", junctions: "0" });
+      entry.error = null;
+    } catch (err) {
+      entry.error = err.message || String(err);
+    }
+    entry.loading = false;
+    if (this._stops === entry) this._render();
   }
 
   _errorText(status, body) {
@@ -249,6 +329,10 @@ class RailTrackingCard extends HTMLElement {
         const reportedPlatform = livePlatform ?? s.actual_platform;
         const cancelled = s.status === "cancelled" || Boolean(s.cancel_type);
         return {
+          uid: s.uid,
+          viaTime: this._via?.[kind]?.get(s.uid),
+          // "via York" is redundant on a train to (or from) York.
+          viaIsEnd: (dep ? s.destination_crs : s.origin_crs) === this._config.via,
           scheduled,
           expected,
           actual,
@@ -262,6 +346,7 @@ class RailTrackingCard extends HTMLElement {
       })
       .filter((s) => {
         if (!s.scheduled) return false;
+        if (this._config.via && !s.viaTime) return false;
         if (!s.actual) return true;
         // Departed trains drop off; arrived ones linger briefly.
         return !dep && minutesBetween(s.actual, nowText) <= ARRIVED_GRACE_MINS;
@@ -301,19 +386,28 @@ class RailTrackingCard extends HTMLElement {
             const operator = show_operator && s.operator ? `<div class="operator">${escapeHtml(s.operator)}</div>` : "";
             const reason = show_reason && s.reason && (s.cancelled || status.time)
               ? `<div class="reason">${escapeHtml(s.reason)}</div>` : "";
-            return `<tr class="${status.cls}">
+            const via = s.viaTime && !s.viaIsEnd
+              ? `<div class="via">via ${escapeHtml(this._via.name)} ${escapeHtml(s.viaTime)}</div>` : "";
+            const open = this._expanded?.uid === s.uid && this._expanded.kind === kind;
+            const stops = open
+              ? `<tr class="stops-row"><td colspan="${show_platform ? 4 : 3}">${this._stopsHtml()}</td></tr>`
+              : "";
+            return `<tr class="${status.cls} service ${open ? "open" : ""}" data-uid="${escapeHtml(s.uid)}"
+                        data-kind="${kind}" tabindex="0" aria-expanded="${open}">
               <td class="time">
                 <span class="${status.time || s.cancelled ? "scheduled struck" : "scheduled"}">${escapeHtml(s.scheduled)}</span>
                 ${status.time ? `<span class="expected">${escapeHtml(status.time)}</span>` : ""}
               </td>
-              <td class="place">${escapeHtml(s.place)}${operator}${reason}</td>
+              <td class="place">${escapeHtml(s.place)}${via}${operator}${reason}</td>
               ${show_platform ? `<td class="platform ${s.platformChanged ? "changed" : ""}"
                   ${s.platformChanged ? 'title="Platform changed"' : ""}>${escapeHtml(s.platform ?? "")}</td>` : ""}
               <td class="status"><span class="badge">${escapeHtml(status.text)}</span></td>
-            </tr>`;
+            </tr>${stops}`;
           })
           .join("")
-      : `<tr><td colspan="4" class="empty">No ${heading.toLowerCase()} in the next ${hours} hour${hours === 1 ? "" : "s"}</td></tr>`;
+      : `<tr><td colspan="4" class="empty">No ${heading.toLowerCase()}${
+          this._via ? ` via ${escapeHtml(this._via.name)}` : ""
+        } in the next ${hours} hour${hours === 1 ? "" : "s"}</td></tr>`;
 
     return `<div class="list">
       ${this._config.mode === "both" ? `<div class="list-title">${heading}</div>` : ""}
@@ -326,11 +420,69 @@ class RailTrackingCard extends HTMLElement {
     </div>`;
   }
 
+  // Calling points of the open train: public stops only, each with its
+  // advertised time and the actual or expected time when it differs.
+  _stopsHtml() {
+    const entry = this._stops;
+    if (!entry?.data) {
+      return entry?.error
+        ? `<div class="error">${escapeHtml(entry.error)}</div>`
+        : `<div class="loading">Loading stops…</div>`;
+    }
+    const c = this._config;
+    const train = entry.data;
+    const trainCancelled = train.status === "cancelled" || train.stp_cancelled === true;
+    const stops = (train.stops ?? []).filter(
+      (s) => s.call_type !== "PASS" && (s.public_arrival || s.public_departure)
+    );
+
+    // Like station boards: departure times up to this station (arrival here
+    // on the arrivals list), arrival times after it.
+    const here = stops.findIndex((s) => s.crs === c.station);
+    const arrivingHere = this._expanded?.kind === "arrivals";
+    const items = stops
+      .map((s, i) => {
+        const arr =
+          !s.public_departure || s.call_type === "TERMINATES" ||
+          (here !== -1 && (i > here || (i === here && arrivingHere)));
+        const scheduled = hhmm(arr ? s.public_arrival : s.public_departure);
+        const actual = hhmm(arr ? s.actual_arrival_uk : s.actual_departure_uk);
+        const expected = actual ?? hhmm(arr ? s.projected_arrival : s.projected_departure);
+        const late = minutesBetween(scheduled, expected);
+        const cancelled = trainCancelled || s.status === "cancelled";
+        let status;
+        if (cancelled) status = `<span class="stop-status late">Cancelled</span>`;
+        else if (late > 0) status = `<span class="stop-status ${late >= 5 ? "late" : "slight"}">${escapeHtml(expected)}</span>`;
+        else status = `<span class="stop-status ontime">${actual ? escapeHtml(actual) : "On time"}</span>`;
+
+        const livePlatform = s.live_platform_suppressed ? null : s.live_platform;
+        const platform = livePlatform ?? s.actual_platform ?? s.platform;
+        const classes = [
+          "stop",
+          actual ? "passed" : "",
+          s.crs === c.station ? "here" : "",
+          c.via && s.crs === c.via ? "via-stop" : "",
+          cancelled ? "cancelled-stop" : "",
+        ].join(" ");
+        return `<li class="${classes}">
+          <span class="stop-time">${escapeHtml(scheduled)}</span>
+          <span class="stop-name">${escapeHtml(titleCase(s.location_name))}</span>
+          ${c.show_platform && platform ? `<span class="stop-platform">${escapeHtml(platform)}</span>` : ""}
+          ${status}
+        </li>`;
+      })
+      .join("");
+
+    const reason = c.show_reason && train.late_reason ? `<div class="reason">${escapeHtml(train.late_reason)}</div>` : "";
+    return `${reason}<ol class="stops">${items}</ol>`;
+  }
+
   _render() {
     if (!this._config || !this.shadowRoot) return;
     const c = this._config;
     const board = this._board;
     const title = c.title ?? (board?.station ? titleCase(board.station) : c.station);
+    const subtitle = c.via ? `via ${this._via?.name ?? c.via}` : "";
 
     let body;
     if (this._error && !board) {
@@ -379,10 +531,40 @@ class RailTrackingCard extends HTMLElement {
         .cancelled .place { color: var(--secondary-text-color); }
         .empty, .loading { color: var(--secondary-text-color); text-align: center; padding: 12px; }
         .error { color: var(--error-color, #db4437); margin-top: 12px; }
+        .subtitle, .via { color: var(--secondary-text-color); font-size: 0.85em; }
+        tr.service { cursor: pointer; }
+        tr.service:hover td, tr.service.open td { background: var(--secondary-background-color); }
+        tr.service:focus-visible { outline: 2px solid var(--primary-color); outline-offset: -2px; }
+        tr.stops-row > td { border-top: none; padding: 0 4px 8px; background: var(--secondary-background-color); }
+        .stops { list-style: none; margin: 0; padding: 4px 0 0 0; }
+        .stop { display: flex; align-items: baseline; gap: 8px; padding: 3px 0 3px 18px; position: relative;
+                font-size: 0.9em; }
+        /* Route line with a dot for each stop. */
+        .stop::before { content: ""; position: absolute; left: 5px; top: 0; bottom: 0; width: 2px;
+                        background: var(--divider-color); }
+        .stop:first-child::before { top: 50%; }
+        .stop:last-child::before { bottom: 50%; }
+        .stop::after { content: ""; position: absolute; left: 2px; top: calc(50% - 4px); width: 8px; height: 8px;
+                       border-radius: 50%; background: var(--card-background-color, #fff);
+                       border: 2px solid var(--primary-color); box-sizing: border-box; }
+        .stop.passed::after { background: var(--primary-color); }
+        .stop.passed { color: var(--secondary-text-color); }
+        .stop.here .stop-name, .stop.via-stop .stop-name { font-weight: 600; }
+        .stop.cancelled-stop .stop-time { text-decoration: line-through; }
+        .stop-time { font-variant-numeric: tabular-nums; width: 3em; flex: none; }
+        .stop-name { flex: 1; }
+        .stop-platform { color: var(--secondary-text-color); font-variant-numeric: tabular-nums; }
+        .stop-status { font-size: 0.85em; white-space: nowrap; }
+        .stop-status.ontime { color: var(--success-color, #43a047); }
+        .stop-status.slight { color: var(--warning-color, #ffa600); }
+        .stop-status.late { color: var(--error-color, #db4437); }
       </style>
       <ha-card>
         <div class="header">
-          <div class="title">${escapeHtml(title)}</div>
+          <div>
+            <div class="title">${escapeHtml(title)}</div>
+            ${subtitle ? `<div class="subtitle">${escapeHtml(subtitle)}</div>` : ""}
+          </div>
           <div class="updated ${this._error && board ? "stale" : ""}"
                title="${escapeHtml(this._error ?? "")}">${this._error && board ? "⚠ " : ""}${updated}</div>
         </div>
@@ -432,8 +614,9 @@ class RailTrackingCardEditor extends HTMLElement {
 
   _onInput(ev) {
     const el = ev.target;
-    if (el.id === "station-search") {
-      if (ev.type === "input") this._onSearch(el.value);
+    const field = el.dataset.search;
+    if (field) {
+      if (ev.type === "input") this._onSearch(field, el.value);
       return;
     }
     const key = el.dataset.key;
@@ -451,20 +634,26 @@ class RailTrackingCardEditor extends HTMLElement {
     this._emit();
   }
 
-  _onSearch(query) {
+  // `field` is the config key the search sets: "station" or "via".
+  _onSearch(field, query) {
     clearTimeout(this._searchTimer);
     const q = query.trim();
+    // Via is optional, so clearing its box removes it.
+    if (field === "via" && !q && this._config.via) {
+      delete this._config.via;
+      this._emit();
+    }
     if (q.length < 2) {
-      this._showResults([]);
+      this._showResults(field, []);
       return;
     }
-    this._searchTimer = setTimeout(() => this._search(q), 300);
+    this._searchTimer = setTimeout(() => this._search(field, q), 300);
   }
 
-  async _search(query) {
+  async _search(field, query) {
     const apiKey = String(this._config.api_key ?? "").trim();
     if (!apiKey) {
-      this._showResults([], "Add your API key above to search for stations.");
+      this._showResults(field, [], "Add your API key above to search for stations.");
       return;
     }
     const seq = (this._searchSeq = (this._searchSeq ?? 0) + 1);
@@ -478,15 +667,15 @@ class RailTrackingCardEditor extends HTMLElement {
       if (seq !== this._searchSeq) return; // a newer search has started
       if (!res.ok) throw new Error(res.status === 401 ? "RailFeed rejected the API key." : body?.error);
       const results = rankStations(body?.results ?? [], query).slice(0, 8);
-      this._showResults(results, results.length ? "" : `No stations match "${query}".`);
+      this._showResults(field, results, results.length ? "" : `No stations match "${query}".`);
     } catch (err) {
-      if (seq === this._searchSeq) this._showResults([], err.message || "Station search failed.");
+      if (seq === this._searchSeq) this._showResults(field, [], err.message || "Station search failed.");
     }
   }
 
-  _showResults(results, message = "") {
-    this._results = results;
-    const box = this.shadowRoot?.getElementById("results");
+  _showResults(field, results, message = "") {
+    this._results = { ...this._results, [field]: results };
+    const box = this.shadowRoot?.querySelector(`.results[data-field="${field}"]`);
     if (!box) return;
     box.innerHTML =
       results
@@ -498,14 +687,29 @@ class RailTrackingCardEditor extends HTMLElement {
         .join("") + (message ? `<div class="hint">${escapeHtml(message)}</div>` : "");
   }
 
-  _pickStation(station) {
+  _pickStation(field, station) {
     if (!station) return;
-    this._config.station = station.crs;
-    this._stationLabel = `${titleCase(station.name)} (${station.crs})`;
-    const input = this.shadowRoot.getElementById("station-search");
-    if (input) input.value = this._stationLabel;
-    this._showResults([]);
+    this._config[field] = station.crs;
+    const label = `${titleCase(station.name)} (${station.crs})`;
+    this._labels = { ...this._labels, [field]: label };
+    const input = this.shadowRoot.querySelector(`input[data-search="${field}"]`);
+    if (input) input.value = label;
+    this._showResults(field, []);
     this._emit();
+  }
+
+  _searchField(field, label, placeholder) {
+    const code = this._config[field] ?? "";
+    const known = this._labels?.[field];
+    // Show the picked name while it still matches the config, else the code.
+    const value = code && known?.endsWith(`(${code})`) ? known : code;
+    return `<div class="wide">
+      <label>${label}
+        <input type="text" data-search="${field}" autocomplete="off"
+               value="${escapeHtml(value)}" placeholder="${escapeHtml(placeholder)}">
+      </label>
+      <div class="results" data-field="${field}"></div>
+    </div>`;
   }
 
   _render() {
@@ -515,16 +719,19 @@ class RailTrackingCardEditor extends HTMLElement {
       this.shadowRoot.addEventListener("input", (ev) => this._onInput(ev));
       this.shadowRoot.addEventListener("change", (ev) => this._onInput(ev));
       this.shadowRoot.addEventListener("click", (ev) => {
-        const button = ev.target.closest("#results button[data-index]");
-        if (button) this._pickStation(this._results?.[Number(button.dataset.index)]);
+        const button = ev.target.closest(".results button[data-index]");
+        if (!button) return;
+        const field = button.closest(".results").dataset.field;
+        this._pickStation(field, this._results?.[field]?.[Number(button.dataset.index)]);
       });
       this.shadowRoot.addEventListener("keydown", (ev) => {
-        if (ev.target.id !== "station-search") return;
+        const field = ev.target.dataset?.search;
+        if (!field) return;
         if (ev.key === "Enter") {
           ev.preventDefault();
-          this._pickStation(this._results?.[0]);
+          this._pickStation(field, this._results?.[field]?.[0]);
         } else if (ev.key === "Escape") {
-          this._showResults([]);
+          this._showResults(field, []);
         }
       });
     }
@@ -547,11 +754,11 @@ class RailTrackingCardEditor extends HTMLElement {
           background: var(--card-background-color, #fff); color: var(--primary-text-color);
         }
         .hint { font-size: 0.8em; color: var(--secondary-text-color); }
-        #results { display: flex; flex-direction: column; margin-top: 4px; }
-        #results button { font: inherit; text-align: left; cursor: pointer; padding: 8px;
+        .results { display: flex; flex-direction: column; margin-top: 4px; }
+        .results button { font: inherit; text-align: left; cursor: pointer; padding: 8px;
                           border: none; border-bottom: 1px solid var(--divider-color, #ccc);
                           background: var(--secondary-background-color); color: var(--primary-text-color); }
-        #results button:hover, #results button:focus { background: var(--divider-color, #ddd); }
+        .results button:hover, .results button:focus { background: var(--divider-color, #ddd); }
         .crs { color: var(--secondary-text-color); font-size: 0.85em; margin-left: 6px; }
       </style>
 
@@ -561,13 +768,8 @@ class RailTrackingCardEditor extends HTMLElement {
         </label>
         <div class="hint wide">It's saved in the dashboard config, so anyone who can edit this dashboard can see it.
           A public_tools key is enough.</div>
-        <div class="wide">
-          <label>Station
-            <input type="text" id="station-search" autocomplete="off"
-                   value="${escapeHtml(this._stationLabel?.endsWith(`(${c.station})`) ? this._stationLabel : c.station)}" placeholder="Search by name or code, e.g. York">
-          </label>
-          <div id="results"></div>
-        </div>
+        ${this._searchField("station", "Station", "Search by name or code, e.g. York")}
+        ${this._searchField("via", "Via (optional)", "Only show trains that also stop here")}
         <label class="wide">Title<input type="text" data-key="title" value="${escapeHtml(c.title)}" placeholder="station name"></label>
         <label>Show
           <select data-key="mode">
